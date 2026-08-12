@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Prize Automation Console</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0d1117;
+      color: #c9d1d9;
+      font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+    }
+    h1 { font-size: 1.3rem; margin-bottom: 0.25rem; color: #f0f6fc; }
+    .sub { color: #8b949e; font-size: 0.85rem; margin-bottom: 1.5rem; }
+    .run-btn {
+      background: #238636;
+      border: none;
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 600;
+      padding: 0.6rem 2rem;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.15s;
+      margin-bottom: 1.5rem;
+    }
+    .run-btn:hover:not(:disabled) { background: #2ea043; }
+    .run-btn:disabled { background: #30363d; color: #8b949e; cursor: not-allowed; }
+    .console {
+      width: 100%;
+      max-width: 820px;
+      background: #010409;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 1rem;
+      height: 60vh;
+      overflow-y: auto;
+      font-family: Consolas, "SFMono-Regular", Menlo, monospace;
+      font-size: 0.85rem;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .console .line.ok { color: #3fb950; }
+    .console .line.warn { color: #d29922; }
+    .console .line.info { color: #79c0ff; }
+    .console .line.result { color: #ff7b72; font-weight: 700; }
+    .status { margin-top: 1rem; color: #8b949e; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <h1>Prize Automation Console</h1>
+  <div class="sub">Runs auto_challenge.py and mirrors its terminal output here.</div>
+  <button id="runBtn" class="run-btn">Run Automation</button>
+  <div id="console" class="console"><span class="line info">[console] Ready. Click "Run Automation" to start.</span></div>
+  <div id="status" class="status">Status: idle</div>
+
+  <script>
+    const runBtn = document.getElementById('runBtn');
+    const consoleEl = document.getElementById('console');
+    const statusEl = document.getElementById('status');
+    let pos = 0;
+    let pollTimer = null;
+
+    function styleLine(text) {
+      if (text.includes('RESULT:') || text.includes('SUB MIT')) return 'result';
+      if (text.includes('[+]') || text.includes('filled')) return 'ok';
+      if (text.includes('[!]')) return 'warn';
+      return 'info';
+    }
+
+    function appendLines(lines) {
+      for (const line of lines) {
+        const div = document.createElement('div');
+        div.className = 'line ' + styleLine(line);
+        div.textContent = line;
+        consoleEl.appendChild(div);
+      }
+      consoleEl.scrollTop = consoleEl.scrollHeight;
+    }
+
+    async function pollLog() {
+      const res = await fetch(`/log?pos=${pos}`);
+      const data = await res.json();
+      if (data.lines.length) {
+        appendLines(data.lines);
+        pos = data.pos;
+      }
+      const sres = await fetch('/status');
+      const status = await sres.json();
+      if (status.running) statusEl.textContent = 'Status: running...';
+      else if (status.ready) statusEl.textContent = 'Status: idle (browser ready)';
+      else statusEl.textContent = 'Status: idle (browser starts on Run)';
+      runBtn.disabled = status.running;
+      if (status.running) {
+        pollTimer = setTimeout(pollLog, 400);
+      } else {
+        clearTimeout(pollTimer);
+      }
+    }
+
+    runBtn.addEventListener('click', async () => {
+      runBtn.disabled = true;
+      consoleEl.innerHTML = '';
+      pos = 0;
+      statusEl.textContent = 'Status: starting...';
+      const res = await fetch('/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const data = await res.json();
+      if (data.error) {
+        statusEl.textContent = data.error;
+        runBtn.disabled = false;
+        return;
+      }
+      pollTimer = setTimeout(pollLog, 400);
+    });
+
+    // Keep the console fresh even while idle (e.g. page reload).
+    pollLog();
+  </script>
+</body>
+</html>
