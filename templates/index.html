@@ -98,6 +98,36 @@
     .bill-card:hover { border-color: #238636; }
     .bill-card img { width: 100%; border-radius: 4px; display: block; }
     .bill-name { color: #8b949e; font-size: 0.8rem; text-align: center; margin-top: 0.4rem; }
+    .lightbox {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.88);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      cursor: zoom-out;
+    }
+    .lightbox img {
+      max-width: 92vw;
+      max-height: 92vh;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      box-shadow: 0 0 30px rgba(0, 0, 0, 0.8);
+    }
+    .lightbox-close {
+      position: fixed;
+      top: 1rem;
+      right: 1.5rem;
+      background: none;
+      border: none;
+      color: #c9d1d9;
+      font-size: 2rem;
+      cursor: pointer;
+      z-index: 1001;
+      line-height: 1;
+    }
+    .lightbox-close:hover { color: #fff; }
   </style>
 </head>
 <body>
@@ -117,6 +147,11 @@
   </div>
   <div id="viewBills" class="hidden">
     <div id="bills" class="bills"><span class="line info">Loading bills...</span></div>
+  </div>
+
+  <div id="lightbox" class="lightbox hidden">
+    <button id="lightboxClose" class="lightbox-close" aria-label="Close">&times;</button>
+    <img id="lightboxImg" src="" alt="Screenshot">
   </div>
 
   <script>
@@ -236,7 +271,7 @@
           img.src = '/ss/' + encodeURIComponent(b.file);
           img.alt = b.name;
           img.loading = 'lazy';
-          img.addEventListener('click', () => window.open(img.src, '_blank'));
+          img.addEventListener('click', () => openLightbox(img.src));
           const cap = document.createElement('div');
           cap.className = 'bill-name';
           cap.textContent = b.name;

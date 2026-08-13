@@ -50,7 +50,8 @@ RUNTIME_DIR = os.path.join(
 )
 CONFIG_PATH = os.path.join(RUNTIME_DIR, "config.json")
 PROFILE_DIR = os.path.join(RUNTIME_DIR, "ChromeProfile")
-# Screenshots of each submitted bill go here, numbered 1st ss, 2nd ss, ...
+# Screenshots of each submitted bill go here, named by bill number
+# (e.g. ABC123456789.png; duplicates get a -2, -3 suffix).
 SS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ss")
 
 FAST_MODE = True   # scale all human delays down; False = original speeds
@@ -1033,14 +1034,24 @@ def _ordinal(n):
     return f"{n}{_ORDINAL_SUFFIXES.get(n % 10, 'th')}"
 
 
-def next_ss_path():
-    """Path of the next numbered screenshot, e.g. ...\\ss\\3rd ss.png.
+def next_ss_path(name=None):
+    """Path of the next screenshot in the ss folder.
 
-    Numbers only count files already named like 'Nth ss.png' (older
-    timestamp-named screenshots are ignored), so numbering starts at
-    '1st ss' regardless of what else is in the folder.
+    With a name (e.g. the bill number) the file is ss\\<name>.png; if that
+    name already exists a numeric suffix is appended (-2, -3, ...) so past
+    screenshots of the same bill are never overwritten. Without a name it
+    falls back to ordinal numbering (1st ss.png, ...), counting only files
+    already named like 'Nth ss.png'.
     """
     os.makedirs(SS_DIR, exist_ok=True)
+    if name:
+        base = re.sub(r"[^\w\-.]+", "_", str(name)).strip("._") or "bill"
+        path = os.path.join(SS_DIR, f"{base}.png")
+        n = 2
+        while os.path.exists(path):
+            path = os.path.join(SS_DIR, f"{base}-{n}.png")
+            n += 1
+        return path
     n = 1
     try:
         nums = []
@@ -1054,10 +1065,13 @@ def next_ss_path():
     return os.path.join(SS_DIR, f"{_ordinal(n)} ss.png")
 
 
-def take_screenshot(driver):
-    """Capture the current page into the ss folder (1st ss.png, 2nd ss.png, ...)."""
+def take_screenshot(driver, name=None):
+    """Capture the current page into the ss folder.
+
+    Default filename is the sanitized bill number, e.g. ABC123456789.png.
+    """
     try:
-        path = next_ss_path()
+        path = next_ss_path(name)
         if driver.save_screenshot(path):
             print(f"[+] Screenshot saved: {path}")
             return path
@@ -1136,7 +1150,7 @@ def run_once(driver, abort_event=None):
     else:
         print(f"[!] Submission sent, but no navigation confirmed within {RESULT_WAIT}s.")
 
-    take_screenshot(driver)
+    take_screenshot(driver, name=data.get("bill_number"))
 
     print("=" * 50)
     if state == "failed":
