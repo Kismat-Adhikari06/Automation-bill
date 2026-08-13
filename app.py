@@ -1,11 +1,12 @@
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_from_directory
 
 app = Flask(__name__)
 
@@ -18,6 +19,10 @@ WORKER = {"proc": None, "ready": False, "running": False}
 
 def _script_path(name):
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+
+
+def _ss_dir():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "ss")
 
 
 def _read_worker(proc):
@@ -79,8 +84,10 @@ def run():
 
     _ensure_worker()
 
-    # First run after the server starts has to cold-start Chrome (can take
-    # up to ~30s). Wait it out here so the run proceeds automatically.
+    # The worker is spawned lazily on the first run and boots in a second or
+    # two, printing READY before Chrome opens. With the startup optimizations
+    # (cached patched chromedriver + persistent profile) the browser itself
+    # opens in ~2s, so the first run proceeds automatically.
     deadline = time.time() + 60
     while time.time() < deadline:
         with RUN_LOCK:
@@ -107,6 +114,22 @@ def status():
         )
 
 
+@app.route("/stop", methods=["POST"])
+def stop():
+    """Ask the worker to abort the current run and close the browser."""
+    with RUN_LOCK:
+        proc = WORKER["proc"]
+    if proc is None or proc.poll() is not None:
+        return jsonify({"error": "Nothing is running."}), 404
+    with STDIN_LOCK:
+        try:
+            proc.stdin.write("STOP\n")
+            proc.stdin.flush()
+        except Exception:
+            return jsonify({"error": "Worker is not responding."}), 500
+    return jsonify({"stopped": True})
+
+
 @app.route("/log")
 def log():
     """Return output lines after `pos`, for client-side polling."""
@@ -119,9 +142,34 @@ def log():
     return jsonify({"lines": lines, "pos": new_pos})
 
 
+@app.route("/bills")
+def bills():
+    """List saved bill screenshots (oldest first) for the 'Your Bills' tab."""
+    d = _ss_dir()
+    if not os.path.isdir(d):
+        return jsonify({"bills": []})
+    files = [f for f in os.listdir(d) if f.lower().endswith(".png")]
+
+    def _num(f):
+        m = re.search(r"(\d+)", f)
+        return int(m.group(1)) if m else 0
+
+    files.sort(key=_num)
+    return jsonify(
+        {"bills": [{"file": f, "name": os.path.splitext(f)[0]} for f in files]}
+    )
+
+
+@app.route("/ss/<path:filename>")
+def ss_file(filename):
+    """Serve a screenshot from the ss folder."""
+    return send_from_directory(_ss_dir(), filename)
+
+
 if __name__ == "__main__":
-    # Chrome is NOT opened here anymore - it only launches when you click
-    # "Run Automation" on the page.
+    # Chrome is NOT opened here - the worker opens it on each "Run Automation"
+    # click and closes it as soon as the run + screenshot is done, so no Chrome
+    # window lingers on the server between runs.
     port = int(os.environ.get("PORT", 8000))
     print(f"Listening on http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False)
