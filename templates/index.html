@@ -48,6 +48,37 @@
     .stop-btn:disabled { background: #30363d; color: #8b949e; cursor: not-allowed; }
     .actions { display: flex; gap: 1rem; align-items: center; margin-bottom: 1.5rem; }
     .actions button { margin-bottom: 0; }
+    .live-panel {
+      width: 100%;
+      max-width: 820px;
+      background: #010409;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      margin-bottom: 1rem;
+      overflow: hidden;
+    }
+    .live-head {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.45rem 0.75rem;
+      border-bottom: 1px solid #30363d;
+      font-size: 0.8rem;
+      color: #c9d1d9;
+      font-weight: 600;
+    }
+    .live-dot { width: 8px; height: 8px; border-radius: 50%; background: #30363d; }
+    .live-dot.on { background: #3fb950; box-shadow: 0 0 6px rgba(63, 185, 80, 0.6); }
+    .live-hint { margin-left: auto; font-weight: 400; color: #8b949e; }
+    .live-body {
+      height: 340px;
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .live-img { max-width: 100%; max-height: 100%; display: block; }
+    .live-idle { color: #8b949e; font-size: 0.85rem; padding: 0 1rem; text-align: center; }
     .console {
       width: 100%;
       max-width: 820px;
@@ -55,7 +86,7 @@
       border: 1px solid #30363d;
       border-radius: 8px;
       padding: 1rem;
-      height: 60vh;
+      height: 38vh;
       overflow-y: auto;
       font-family: Consolas, "SFMono-Regular", Menlo, monospace;
       font-size: 0.85rem;
@@ -132,7 +163,7 @@
 </head>
 <body>
   <h1>Prize Automation Console</h1>
-  <div class="sub">Runs auto_challenge.py (same optimized startup as the CLI) and mirrors its output here.</div>
+  <div class="sub">Runs auto_challenge.py (same optimized startup as the CLI), streams the browser to the Live View panel, and mirrors its output here.</div>
   <div class="tabs">
     <button id="tabRun" class="tab active">Run</button>
     <button id="tabBills" class="tab">Your Bills</button>
@@ -141,6 +172,16 @@
     <div class="actions">
       <button id="runBtn" class="run-btn">Run Automation</button>
       <button id="stopBtn" class="stop-btn" disabled>Stop</button>
+    </div>
+    <div class="live-panel">
+      <div class="live-head">
+        <span id="liveDot" class="live-dot"></span>Live View
+        <span id="liveHint" class="live-hint">idle</span>
+      </div>
+      <div class="live-body">
+        <img id="liveImg" class="live-img hidden" alt="Live automation view">
+        <div id="liveIdle" class="live-idle">Waiting for a run &mdash; press &ldquo;Run Automation&rdquo;.</div>
+      </div>
     </div>
     <div id="console" class="console"><span class="line info">[console] Ready. Click "Run Automation" to start.</span></div>
     <div id="status" class="status">Status: idle</div>
@@ -168,6 +209,37 @@
     let pollTimer = null;
     let billsTimer = null;
     let lastBillsKey = null;
+
+    const liveDot = document.getElementById('liveDot');
+    const liveHint = document.getElementById('liveHint');
+    const liveImg = document.getElementById('liveImg');
+    const liveIdle = document.getElementById('liveIdle');
+    let liveAttached = false;
+
+    function showLive(on) {
+      if (on && !liveAttached) {
+        liveAttached = true;
+        liveImg.src = '/live';
+        liveIdle.classList.add('hidden');
+        liveImg.classList.remove('hidden');
+        liveHint.textContent = 'connecting\u2026';
+        liveDot.classList.add('on');
+      } else if (!on && liveAttached) {
+        liveAttached = false;
+        liveImg.removeAttribute('src');
+        liveImg.classList.add('hidden');
+        liveIdle.classList.remove('hidden');
+        liveHint.textContent = 'idle';
+        liveDot.classList.remove('on');
+      }
+    }
+
+    liveImg.addEventListener('load', () => {
+      if (liveAttached) liveHint.textContent = 'streaming';
+    });
+    liveImg.addEventListener('error', () => {
+      if (liveAttached) liveHint.textContent = 'reconnecting\u2026';
+    });
 
     function styleLine(text) {
       if (text.includes('RESULT:') || text.includes('SUB MIT')) return 'result';
@@ -200,6 +272,7 @@
       else statusEl.textContent = 'Status: idle (starting worker...)';
       runBtn.disabled = status.running;
       stopBtn.disabled = !status.running;
+      showLive(status.running);
       if (status.running) {
         pollTimer = setTimeout(pollLog, 400);
       } else {

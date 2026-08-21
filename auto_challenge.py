@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -54,8 +55,12 @@ PROFILE_DIR = os.path.join(RUNTIME_DIR, "ChromeProfile")
 # (e.g. ABC123456789.png; duplicates get a -2, -3 suffix).
 SS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ss")
 
+# Live view: while a web-app run is active, a background thread saves page
+# screenshots to a temp-dir file that app.py streams to the page as MJPEG.
+LIVE_FRAME_INTERVAL = 0.35  # seconds between live-view frames
+
 FAST_MODE = True   # scale all human delays down; False = original speeds
-BULK_FILL = True   # fill all form fields in one JS pass; False = one-by-one
+BULK_FILL = True   # True = quick per-field fill, scrolled into view; False = human-paced typing
 
 CHECKBOX_TIMEOUT = 30  # seconds to wait for iframe / checkbox
 SHORT_WAIT = 3         # seconds to wait per checkbox selector before moving on
@@ -75,6 +80,30 @@ DUMMY_FORM_DATA = {
     "mobile_number": "9841234567",       # 7-15 digits
     "address": "Kathmandu, Nepal",       # 5-250 characters
 }
+
+# When run from the CLI (python auto_challenge.py), EVERY entry in this list
+# is submitted IN PARALLEL - one Chrome window per entry, each with its own
+# profile and screenshot named by its bill number. The web app's "Run" button
+# keeps submitting a single entry (its form fields override via FORM_* envs).
+MULTI_FORM_DATA = [
+    dict(DUMMY_FORM_DATA),
+    {
+        "bill_number": "XYZ987654321",   # 2nd parallel entry
+        "seller_pan_no": "712345689",
+        "billed_total_amount": "1999.99",
+        "name": "Sita Kumari Shrestha",
+        "mobile_number": "9861234567",
+        "address": "Lalitpur, Nepal",
+    },
+    {
+        "bill_number": "LMN456789012",   # 3rd parallel entry
+        "seller_pan_no": "823456781",
+        "billed_total_amount": "3200.75",
+        "name": "Hari Prasad Adhikari",
+        "mobile_number": "9812345670",
+        "address": "Biratnagar, Nepal",
+    },
+]
 
 
 # ============================================================
@@ -298,6 +327,24 @@ def fill_form(driver, data):
         "});"
         "return missing;"
     )
+    # Same setter, but scrolls the field into view first - used for the
+    # watched, one-field-at-a-time pass below.
+    visual_script = (
+        "const name = arguments[0], value = arguments[1];"
+        "const el = document.querySelector(`input[name='${name}']`);"
+        "if (!el) return 'missing';"
+        "el.scrollIntoView({behavior: 'smooth', block: 'center'});"
+        "const proto = el instanceof HTMLTextAreaElement"
+        "  ? HTMLTextAreaElement.prototype"
+        "  : el instanceof HTMLSelectElement"
+        "    ? HTMLSelectElement.prototype"
+        "    : HTMLInputElement.prototype;"
+        "const desc = Object.getOwnPropertyDescriptor(proto, 'value');"
+        "desc.set.call(el, value);"
+        "el.dispatchEvent(new Event('input', {bubbles: true}));"
+        "el.dispatchEvent(new Event('change', {bubbles: true}));"
+        "return 'ok';"
+    )
 
     try:
         WebDriverWait(driver, CHECKBOX_TIMEOUT).until(
@@ -307,7 +354,18 @@ def fill_form(driver, data):
         print("[!] Form fields did not all appear; falling back to one-by-one.")
         return _fill_form_human(driver, fields)
 
-    time.sleep(0.3)  # let the page settle before writing
+    # Fill one field at a time, smooth-scrolling each into view like a human
+    # would, so the live feed shows the data going in as it happens.
+    for name, value in fields:
+        try:
+            result = driver.execute_script(visual_script, name, value)
+        except Exception:
+            break  # page changed under us; the verified retry loop handles it
+        if result == "missing":
+            break
+        print(f"[+] Filled {name}: {value}")
+        time.sleep(0.25)  # beat between fields keeps the scrolling readable
+
     for attempt in range(1, 4):
         try:
             missing = driver.execute_script(script, names, values)
@@ -316,8 +374,6 @@ def fill_form(driver, data):
             print(f"[!] Bulk fill attempt {attempt} error: {e}")
             bad, missing = 99, ["error"]
         if not missing and bad == 0:
-            for name, value in fields:
-                print(f"[+] Filled {name}: {value}")
             return len(fields)
         print(f"[!] Fill attempt {attempt} didn't stick ({bad} mismatched); retrying.")
         time.sleep(0.5)
@@ -335,6 +391,11 @@ def _fill_form_human(driver, fields):
                 EC.presence_of_element_located(
                     (By.CSS_SELECTOR, f"input[name='{field_name}']")
                 )
+            )
+            driver.execute_script(
+                "arguments[0].scrollIntoView("
+                "{behavior: 'smooth', block: 'center'});",
+                field,
             )
             human_delay()
             field.clear()
@@ -491,6 +552,38 @@ def _turnstile_token_granted(driver):
         return bool(token and token.strip())
     except Exception:
         return False
+
+
+def _scroll_captcha_into_view(driver):
+    """Smooth-scroll the Turnstile widget/challenge area into view.
+
+    Scrolling happens in the PARENT document - scrolling an element inside
+    the challenge iframe would not move the main page. This keeps the live
+    feed on the captcha while it is being solved instead of jumping around
+    only later (at checkbox/submit click time).
+    """
+    targets = []
+    try:
+        targets.extend(driver.find_elements(By.CLASS_NAME, "turnstile-widget"))
+    except Exception:
+        pass
+    try:
+        iframe = find_challenge_iframe(driver, timeout=2)
+        if iframe is not None:
+            targets.append(iframe)
+    except Exception:
+        pass
+    for el in targets:
+        try:
+            driver.execute_script(
+                "arguments[0].scrollIntoView("
+                "{behavior: 'smooth', block: 'center'});",
+                el,
+            )
+            return True
+        except Exception:
+            continue
+    return False
 
 
 def click_submit(driver, abort_event=None):
@@ -798,6 +891,54 @@ def _page_ready(driver):
         return False
 
 
+def _live_frame_paths():
+    """(tmp, final) paths of the shared live-view frame file.
+
+    app.py reads the final path - keep the filename in sync with LIVE_FRAME
+    there. Sits in the system temp dir (not the OneDrive project folder) so
+    writing several frames per second never triggers sync churn.
+    """
+    base = os.path.join(tempfile.gettempdir(), "prize_automation_live")
+    return base + ".tmp", base + ".png"
+
+
+def _clear_live_frame():
+    """Remove the live-view frame (and any half-written temp copy)."""
+    tmp, final = _live_frame_paths()
+    for path in (tmp, final):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _live_capture_loop(driver_getter, stop_event):
+    """Screenshot the active run into the shared frame file until stopped.
+
+    Daemon thread started per web-app run. os.replace makes each frame appear
+    atomically, so app.py never streams a half-written image. When the driver
+    is missing or errors (e.g. browser just closed), the frame file is
+    dropped so the webpage falls back to its idle state instead of showing
+    stale pixels.
+    """
+    tmp, final = _live_frame_paths()
+    while not stop_event.is_set():
+        driver = driver_getter()
+        if driver is None:
+            _clear_live_frame()
+            stop_event.wait(0.5)
+            continue
+        try:
+            png = driver.get_screenshot_as_png()
+            with open(tmp, "wb") as f:
+                f.write(png)
+            os.replace(tmp, final)
+        except Exception:
+            _clear_live_frame()
+        stop_event.wait(LIVE_FRAME_INTERVAL)
+    _clear_live_frame()
+
+
 def _chrome_pids():
     """PIDs of every running Chrome process (used to tell if any Chrome remains)."""
     try:
@@ -816,18 +957,19 @@ def _chrome_pids():
         return []
 
 
-def _automation_chrome_pids():
-    """PIDs of Chrome instances running with OUR dedicated profile.
+def _automation_chrome_pids(marker="PrizeAutomation"):
+    """PIDs of Chrome instances running with OUR dedicated profile(s).
 
-    This identifies exactly the Chrome that does the automation (its command
-    line contains the PrizeAutomation profile dir), so a close/force-kill
-    never touches the user's own Chrome.
+    Matches Chrome command lines against a regex marker - by default the
+    PrizeAutomation runtime dir, so a close/force-kill never touches the
+    user's own Chrome. Parallel runs pass their own profile dir as the
+    marker so closing one run never kills its siblings.
     """
     pids = []
     try:
         if os.name == "nt":
             ps = ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" "
-                  "| Where-Object { $_.CommandLine -match 'PrizeAutomation' } "
+                  f"| Where-Object {{ $_.CommandLine -match '{marker}' }} "
                   "| Select-Object -ExpandProperty ProcessId")
             out = subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
@@ -835,7 +977,7 @@ def _automation_chrome_pids():
             ).stdout
         else:
             out = subprocess.run(
-                ["pgrep", "-f", "PrizeAutomation"], capture_output=True, text=True, timeout=15,
+                ["pgrep", "-f", marker], capture_output=True, text=True, timeout=15,
             ).stdout
         for tok in out.split():
             tok = tok.strip()
@@ -884,8 +1026,32 @@ def close_automation_browser(driver):
         print("[*] No Chrome remaining; automation stopped.")
 
 
-def create_driver():
+def close_browser_for(driver, profile_dir):
+    """Close ONE parallel run's Chrome without touching its siblings.
+
+    driver.quit() closes that browser; if it lingers, only Chrome processes
+    whose command line matches this run's profile dir are force-killed, so
+    the other concurrent runs keep going.
+    """
+    if driver is not None:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+    marker = re.escape(os.path.abspath(profile_dir))
+    leftover = _automation_chrome_pids(marker)
+    if leftover:
+        print(f"[*] Chrome for profile {os.path.basename(profile_dir)} still alive "
+              f"(PIDs {leftover}); force-closing it.")
+        _force_close_chrome(leftover)
+
+
+def create_driver(profile_dir=None):
     """Build the undetected Chrome driver with stability-focused flags.
+
+    profile_dir lets parallel runs use their own Chrome profile (Chrome locks
+    a profile dir, so each concurrent browser needs a distinct one). Defaults
+    to the shared PROFILE_DIR for single-run mode.
 
     HEADLESS is driven by the HEADLESS env var (see CONFIGURATION); visible
     mode stays the default fallback.
@@ -930,6 +1096,16 @@ def create_driver():
     options.add_argument("--no-first-run")
     options.add_argument("--no-default-browser-check")
     options.add_argument("--disable-infobars")
+    # Keep the renderer "foreground" no matter what. Without these, Windows
+    # occlusion/background throttling pauses Turnstile's challenge loop
+    # whenever the Chrome window is covered or unfocused - the widget sat at
+    # "loading" until a human brought the window forward. With them the run
+    # behaves identically whether or not anyone is looking (the webpage's
+    # Live View stream does NOT count as watching - these flags do).
+    options.add_argument("--disable-backgrounding-occluded-windows")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-features=CalculateNativeWinOcclusion")
     if not HEADLESS and HIDE_WINDOW:
         # Keep a real, rendering browser (the captcha needs it) but position
         # the window off-screen so the user never sees it. Off-screen does
@@ -939,11 +1115,13 @@ def create_driver():
     elif not HEADLESS:
         options.add_argument("--start-maximized")
 
+    profile_dir = profile_dir or PROFILE_DIR
     kwargs = {
         "options": options,
         # Persistent dedicated profile (local, not OneDrive): a warm session
-        # reuses cookies/site data and boots noticeably faster.
-        "user_data_dir": PROFILE_DIR,
+        # reuses cookies/site data and boots noticeably faster. Parallel runs
+        # each get their own profile dir so they don't fight over the lock.
+        "user_data_dir": profile_dir,
     }
     if version is not None:
         kwargs["version_main"] = version
@@ -973,19 +1151,19 @@ def create_driver():
     return driver
 
 
-def start_driver():
+def start_driver(profile_dir=None, verbose=True):
     """Create a driver and load the page, retrying up to 3 times.
 
-    Chrome sometimes opens and instantly closes on the first try
-    (locked user-data-dir, stale driver cache, etc.). A fresh attempt
-    usually fixes it without user intervention.
+    profile_dir is forwarded to create_driver (parallel runs each get their
+    own Chrome profile). verbose=False suppresses the shared TIMINGS dump,
+    which would be misleading when several browsers start at once.
     """
     last_err = None
     TIMINGS.setdefault("t0", time.perf_counter())
     for attempt in range(1, 4):
         driver = None
         try:
-            driver = create_driver()
+            driver = create_driver(profile_dir=profile_dir)
             driver.get(TARGET_URL)
             TIMINGS["nav_done"] = time.perf_counter()
             # Confirm the target page actually rendered before returning so
@@ -995,7 +1173,8 @@ def start_driver():
                     f"Target page did not load within {PAGE_LOAD_TIMEOUT}s"
                 )
             TIMINGS["ready_done"] = time.perf_counter()
-            _print_startup_timings()
+            if verbose:
+                _print_startup_timings()
             print(f"[+] Page loaded: {driver.current_url} (title: {_safe(driver.title)!r})")
             if HEADLESS:
                 # Confirm headlessness on the live session used for this run.
@@ -1080,119 +1259,148 @@ def take_screenshot(driver, name=None):
     return None
 
 
-def run_once(driver, abort_event=None):
+def run_once(driver, abort_event=None, data=None, tag=""):
     """Execute one full fill -> captcha -> submit cycle on an open driver.
 
-    If abort_event is set, the run bails out before each step so the web
-    app's Stop button can halt a run mid-flight.
+    data is the form dict to fill (defaults to build_form_data(), which the
+    web app overrides via FORM_* env vars). tag (e.g. "[bill XYZ123]") is
+    prefixed to log lines so parallel runs are distinguishable. If
+    abort_event is set, the run bails out before each step so the web app's
+    Stop button can halt a run mid-flight.
     """
+    data = data if data is not None else build_form_data()
+    bill = data.get("bill_number", "?")
+    tag = tag or f"[{bill}]"
+
+    def log(msg):
+        print(f"{tag} {msg}")
+
     human_delay()
 
     if _aborted(abort_event):
-        print("[!] Run aborted.")
+        log("[!] Run aborted.")
         return False
 
-    print("[1/3] Filling form...")
-    data = build_form_data()
+    log("[1/3] Filling form...")
     filled = fill_form(driver, data)
     if filled == len(data):
-        print(f"[+] Form filled successfully: {filled}/{len(data)} fields.")
+        log(f"[+] Form filled successfully: {filled}/{len(data)} fields.")
     else:
-        print(f"[!] Form fill incomplete: {filled}/{len(data)} fields.")
+        log(f"[!] Form fill incomplete: {filled}/{len(data)} fields.")
 
     if _aborted(abort_event):
-        print("[!] Run aborted after form fill.")
+        log("[!] Run aborted after form fill.")
         return False
 
-    print("[2/3] Solving captcha...")
+    log("[2/3] Solving captcha...")
     if _turnstile_widget_present(driver):
-        print("[*] Turnstile widget appeared on the page.")
+        log("[*] Turnstile widget appeared on the page.")
     else:
-        print("[*] Turnstile widget not found (may not have loaded yet).")
+        log("[*] Turnstile widget not found (may not have loaded yet).")
+    _scroll_captcha_into_view(driver)
     # Best-effort checkbox click. The captcha may already auto-pass,
     # so a miss here must NOT abort the flow.
     iframe = find_challenge_iframe(driver)
     if iframe is not None:
         driver.switch_to.frame(iframe)
         if click_checkbox(driver):
-            print("[+] Captcha ticked and confirmed.")
+            log("[+] Captcha ticked and confirmed.")
         else:
-            print("[!] Checkbox not found inside iframe; continuing.")
+            log("[!] Checkbox not found inside iframe; continuing.")
         driver.switch_to.default_content()
     else:
-        print("[!] No challenge iframe found; assuming captcha auto-passes.")
+        log("[!] No challenge iframe found; assuming captcha auto-passes.")
 
     if _aborted(abort_event):
-        print("[!] Run aborted before submit.")
+        log("[!] Run aborted before submit.")
         return False
 
-    print("[3/3] Submitting...")
+    log("[3/3] Submitting...")
     # Automatically submit once the captcha token unlocks the button.
     # click_submit() handles all waiting for the token/button.
     clicked = click_submit(driver, abort_event=abort_event)
 
     if _aborted(abort_event):
-        print("[!] Run aborted after submit.")
+        log("[!] Run aborted after submit.")
         return False
 
     # Pause briefly for the result page to render.
     time.sleep(TOKEN_WAIT if not FAST_MODE else 3)
 
     if not clicked:
-        print("[!] RESULT: SUBMISSION FAILED (submit button was never clicked).")
+        log("[!] RESULT: SUBMISSION FAILED (submit button was never clicked).")
         return False
 
     state = _post_submit_check(driver)
     if state == "ok":
-        print(f"[+] Submission succeeded: navigated to {driver.current_url!r}")
+        log(f"[+] Submission succeeded: navigated to {driver.current_url!r}")
     elif state == "failed":
-        print("[!] Submission failed: the page showed field/validation errors.")
+        log("[!] Submission failed: the page showed field/validation errors.")
     else:
-        print(f"[!] Submission sent, but no navigation confirmed within {RESULT_WAIT}s.")
+        log(f"[!] Submission sent, but no navigation confirmed within {RESULT_WAIT}s.")
 
     take_screenshot(driver, name=data.get("bill_number"))
 
-    print("=" * 50)
+    log("=" * 50)
     if state == "failed":
-        print("[!] RESULT: SUBMISSION FAILED.")
+        log("[!] RESULT: SUBMISSION FAILED.")
     else:
-        print("[+] RESULT: BUTTON WAS CLICKED SUCCESSFULLY.")
-    print("=" * 50)
+        log("[+] RESULT: BUTTON WAS CLICKED SUCCESSFULLY.")
+    log("=" * 50)
     return state != "failed"
 
 
-def main():
-    """Run one automation cycle: open Chrome, run, save screenshot, close.
+def _run_entry(data, idx, results):
+    """One parallel run: own Chrome + own profile, fill, submit, screenshot."""
+    bill = data.get("bill_number", "?")
+    tag = f"[{bill}]"
+    profile = os.path.join(RUNTIME_DIR, f"ChromeProfile{idx}")
+    driver = None
+    try:
+        print(f"{tag} Opening parallel Chrome (profile ChromeProfile{idx})...")
+        driver = start_driver(profile_dir=profile, verbose=False)
+        ok = run_once(driver, data=data, tag=tag)
+        results.append(bool(ok))
+    except Exception as e:
+        print(f"{tag} [!] Parallel run failed: {_safe(str(e))}")
+        results.append(False)
+    finally:
+        close_browser_for(driver, profile)
+        print(f"{tag} Chrome closed after run.")
 
-    Chrome closes as soon as the run finishes and the screenshot is saved to
-    the ss folder, so nothing lingers on screen. The terminal then offers
-    another run (which opens a fresh Chrome); typing 'q' or closing stdin
+
+def main():
+    """Run every entry in MULTI_FORM_DATA in parallel.
+
+    Each entry opens its OWN Chrome window (its own profile dir) so multiple
+    bills are submitted at the same time; every screenshot lands in the ss
+    folder named by its bill number. When every browser has finished, the
+    terminal offers another parallel round; typing 'q' or closing stdin
     (EOF) exits.
     """
-    driver = None
-    _reset_timings()
+    entries = list(MULTI_FORM_DATA)
+    print(f"[*] Parallel mode: {len(entries)} submission(s), "
+          f"{len(entries)} Chrome window(s).")
     try:
         while True:
-            if driver is None:
-                driver = start_driver()
-            try:
-                run_once(driver)
-            except Exception as e:
-                print(f"[!] Run failed: {e}")
-            finally:
-                # Close the automation's Chrome right after the run
-                # (screenshot already saved to the ss folder).
-                close_automation_browser(driver)
-                driver = None
-                print("[*] Chrome closed after run.")
+            results = []
+            threads = [
+                threading.Thread(target=_run_entry, args=(data, i, results))
+                for i, data in enumerate(entries)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            ok = sum(1 for r in results if r)
+            print(f"[*] Parallel round finished: {ok}/{len(entries)} succeeded.")
 
             if HEADLESS or os.environ.get("WEB_MODE"):
-                # Nothing to look at (headless) or the web app owns the console.
                 print("[*] Run finished.")
                 break
 
             try:
-                again = input("[*] Press Enter to run again or 'q' to quit: ")
+                again = input("[*] Press Enter to run all again or 'q' to quit: ")
             except EOFError:
                 print("[*] Run finished.")
                 break
@@ -1200,7 +1408,11 @@ def main():
                 print("[*] Run finished.")
                 break
     finally:
-        close_automation_browser(driver)
+        # Make sure no automation Chrome survives if we exit mid-round.
+        leftover = _automation_chrome_pids()
+        if leftover:
+            print("[*] Closing any remaining automation Chrome...")
+            _force_close_chrome(leftover)
 
 
 def _recreate_driver(driver):
@@ -1280,6 +1492,7 @@ def service_loop():
 
     mode = "HEADLESS" if HEADLESS else "VISIBLE"
     keep = "stays open between runs" if KEEP_BROWSER_OPEN else "opens per run"
+    _clear_live_frame()  # drop any frame left behind by a previous worker
     print(f"[service] Worker ready. Browser {keep} ({mode} mode).")
     print("READY", flush=True)
     running = False
@@ -1318,6 +1531,13 @@ def service_loop():
                     driver = _recreate_driver(driver)
 
             running = True
+            live_stop = threading.Event()
+            live_thread = threading.Thread(
+                target=_live_capture_loop,
+                args=(lambda: driver, live_stop),
+                daemon=True,
+            )
+            live_thread.start()
             try:
                 run_once(driver, abort_event=stop_event)
             except Exception as e:
@@ -1327,6 +1547,8 @@ def service_loop():
                     print("[*] Browser recreated; ready for next run.")
             finally:
                 running = False
+                live_stop.set()
+                live_thread.join(timeout=2)
 
             if stop_event.is_set():
                 print("[!] Run aborted by Stop request.")

@@ -70,11 +70,13 @@ would use those values without editing any code.
 
 ### 4. What a run does (`auto_challenge.py:550` `run_once()`)
 
-1. **Fill form** — sets every input in one JS pass (bulk fill) using native
-   setters + `input`/`change` events so React-style validation fires, then
-   verifies the values stuck (retries, falls back to one-by-one).
-2. **Solve captcha** — Turnstile usually auto-passes. If not, it tries a real
-   mouse click on the checkbox iframe inside the widget's shadow DOM.
+1. **Fill form** — fills each field one at a time via JS (native setters +
+   `input`/`change` events so React-style validation fires), smooth-scrolling
+   every field into view first so the Live View shows the data going in;
+   values are then verified and retried (falls back to human-paced typing).
+2. **Solve captcha** — the widget is scrolled into view, then Turnstile
+   usually auto-passes. If not, it tries a real mouse click on the checkbox
+   iframe inside the widget's shadow DOM.
 3. **Submit** — waits for the submit button to unlock (only happens once the
    Turnstile token is granted), then clicks it.
 

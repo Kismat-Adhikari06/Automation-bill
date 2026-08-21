@@ -3,10 +3,11 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
-from flask import Flask, jsonify, render_template, request, send_from_directory
+from flask import Flask, Response, jsonify, render_template, request, send_from_directory
 
 app = Flask(__name__)
 
@@ -15,6 +16,10 @@ RUN_LOCK = threading.Lock()
 STDIN_LOCK = threading.Lock()
 
 WORKER = {"proc": None, "ready": False, "running": False}
+
+# Latest automation screenshot, written by the worker's live-capture thread
+# (see _live_frame_paths in auto_challenge.py - keep the filename in sync).
+LIVE_FRAME = os.path.join(tempfile.gettempdir(), "prize_automation_live.png")
 
 
 def _script_path(name):
@@ -109,9 +114,9 @@ def run():
 @app.route("/status")
 def status():
     with RUN_LOCK:
-        return jsonify(
-            {"running": WORKER["running"], "ready": WORKER["ready"]}
-        )
+        payload = {"running": WORKER["running"], "ready": WORKER["ready"]}
+    payload["live"] = os.path.exists(LIVE_FRAME)
+    return jsonify(payload)
 
 
 @app.route("/stop", methods=["POST"])
@@ -164,6 +169,40 @@ def bills():
 def ss_file(filename):
     """Serve a screenshot from the ss folder."""
     return send_from_directory(_ss_dir(), filename)
+
+
+@app.route("/live")
+def live():
+    """Stream the worker's live-view frames as MJPEG (PNG parts).
+
+    The page's <img> element points here; Chrome plays the multipart stream
+    natively, no JS needed. A part is only sent when the frame file's mtime
+    changed, so an unchanged page costs no bandwidth.
+    """
+    def gen():
+        last_stamp = None
+        while True:
+            try:
+                stamp = os.path.getmtime(LIVE_FRAME)
+                if stamp != last_stamp:
+                    with open(LIVE_FRAME, "rb") as f:
+                        data = f.read()
+                    last_stamp = stamp
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/png\r\n"
+                        b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n"
+                        + data + b"\r\n"
+                    )
+                    continue
+            except OSError:
+                # No live run right now (or file mid-replace); retry shortly.
+                last_stamp = None
+            time.sleep(0.15)
+
+    return Response(
+        gen(), mimetype="multipart/x-mixed-replace; boundary=frame"
+    )
 
 
 if __name__ == "__main__":
